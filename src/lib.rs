@@ -26,6 +26,9 @@ pub mod error;
 pub mod key;
 pub mod node;
 pub mod store;
+pub mod valheap;
+pub mod wal;
+pub mod trie;
 
 pub use error::{Result, TrieError};
 pub use key::TrieKey;
@@ -36,3 +39,5 @@ pub use node::{
     NULL_PAGE, PAGE_SIZE, VERSION,
 };
 pub use store::PageStore;
+pub use valheap::ValHeap;
+pub use trie::MappedVarTrie;
