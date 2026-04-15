@@ -1868,4 +1868,592 @@ mod tests {
         assert_eq!(t.len().unwrap(), (MAX_CHILDREN + 1) as u64);
         assert!(!wal::wal_path(&db_path).exists());
     }
+
+    // -----------------------------------------------------------------------
+    // Stress helpers
+    // -----------------------------------------------------------------------
+
+    /// Simple linear-congruential generator for deterministic "random" data.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// Encode a multi-segment key to a single `Vec<u8>` that is unique per
+    /// distinct segment sequence — used as the HashMap reference key.
+    fn model_key(segs: &[Vec<u8>]) -> Vec<u8> {
+        let mut k = Vec::new();
+        for seg in segs {
+            k.extend_from_slice(&(seg.len() as u16).to_le_bytes());
+            k.extend_from_slice(seg);
+        }
+        k
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional TrieKey implementations
+    // -----------------------------------------------------------------------
+
+    /// A path-style key: splits a string on `'/'` and yields each component as
+    /// raw bytes.  E.g. `"a/b/c"` → segments `[b"a", b"b", b"c"]`.
+    struct PathKey(String);
+
+    impl TrieKey for PathKey {
+        type Segment = Vec<u8>;
+        type SegmentIter<'a> = std::iter::Map<std::str::Split<'a, char>, fn(&str) -> Vec<u8>>;
+
+        fn segments(&self) -> Self::SegmentIter<'_> {
+            self.0.split('/').map(|s| s.as_bytes().to_vec())
+        }
+    }
+
+    /// A DNS-style key: stores labels in reverse order so that `example.com`
+    /// becomes segments `[b"com", b"example"]`, enabling efficient prefix
+    /// lookups over a domain hierarchy.
+    struct DomainKey(Vec<Vec<u8>>);
+
+    impl TrieKey for DomainKey {
+        type Segment = Vec<u8>;
+        type SegmentIter<'a> = std::iter::Cloned<std::slice::Iter<'a, Vec<u8>>>;
+
+        fn segments(&self) -> Self::SegmentIter<'_> {
+            self.0.iter().cloned()
+        }
+    }
+
+    fn domain_key(domain: &str) -> DomainKey {
+        // Reverse the dot-split labels so the trie groups by TLD first.
+        let labels: Vec<Vec<u8>> = domain
+            .split('.')
+            .rev()
+            .map(|l| l.as_bytes().to_vec())
+            .collect();
+        DomainKey(labels)
+    }
+
+    /// A numeric key: each element is a `u32` stored as 4 big-endian bytes.
+    struct NumericKey(Vec<u32>);
+
+    impl TrieKey for NumericKey {
+        type Segment = [u8; 4];
+        type SegmentIter<'a> =
+            std::iter::Map<std::slice::Iter<'a, u32>, fn(&u32) -> [u8; 4]>;
+
+        fn segments(&self) -> Self::SegmentIter<'_> {
+            self.0.iter().map(|n| n.to_be_bytes())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Key variety tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn key_empty_segment_in_multi_segment_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // An empty byte slice is a valid (zero-length) segment.
+        t.insert(&[b"a", b"", b"b"], b"val").unwrap();
+        assert_eq!(t.get(&[b"a", b"", b"b"]).unwrap(), Some(b"val".to_vec()));
+        assert_eq!(t.get(&[b"a", b"b"]).unwrap(), None);
+        assert_eq!(t.get(&[b"a"]).unwrap(), None);
+    }
+
+    #[test]
+    fn key_null_bytes_in_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let seg_with_null = b"he\x00llo";
+        t.insert(&[seg_with_null], b"v1").unwrap();
+        // Same segment including the null byte matches.
+        assert_eq!(
+            t.get(&[seg_with_null]).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        // Truncated at null does NOT match.
+        assert_eq!(t.get(&[b"he"]).unwrap(), None);
+        // Past-null portion alone does NOT match.
+        assert_eq!(t.get(&[b"llo"]).unwrap(), None);
+    }
+
+    #[test]
+    fn key_same_byte_different_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // These three segments differ only in length.
+        t.insert(&[b"\xAA"], b"one").unwrap();
+        t.insert(&[b"\xAA\xAA"], b"two").unwrap();
+        t.insert(&[b"\xAA\xAA\xAA"], b"three").unwrap();
+
+        assert_eq!(t.get(&[b"\xAA"]).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(t.get(&[b"\xAA\xAA"]).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(t.get(&[b"\xAA\xAA\xAA"]).unwrap(), Some(b"three".to_vec()));
+
+        t.delete(&[b"\xAA\xAA"]).unwrap();
+        assert_eq!(t.get(&[b"\xAA\xAA"]).unwrap(), None);
+        // Siblings unaffected.
+        assert_eq!(t.get(&[b"\xAA"]).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(t.get(&[b"\xAA\xAA\xAA"]).unwrap(), Some(b"three".to_vec()));
+    }
+
+    #[test]
+    fn key_prefix_relation_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Key A is a strict prefix of key B (different segment counts).
+        t.insert(&[b"prefix"], b"short").unwrap();
+        t.insert(&[b"prefix", b"suffix"], b"long").unwrap();
+
+        assert_eq!(t.get(&[b"prefix"]).unwrap(), Some(b"short".to_vec()));
+        assert_eq!(
+            t.get(&[b"prefix", b"suffix"]).unwrap(),
+            Some(b"long".to_vec())
+        );
+
+        // Deleting the shorter key must not affect the longer one.
+        t.delete(&[b"prefix"]).unwrap();
+        assert_eq!(t.get(&[b"prefix"]).unwrap(), None);
+        assert_eq!(
+            t.get(&[b"prefix", b"suffix"]).unwrap(),
+            Some(b"long".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_segments_one_byte_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Segments that differ only in their last byte.
+        for i in 0u8..10 {
+            let seg = vec![0u8, 1u8, i];
+            t.insert(&[&seg], &[i]).unwrap();
+        }
+        for i in 0u8..10 {
+            let seg = vec![0u8, 1u8, i];
+            assert_eq!(t.get(&[&seg]).unwrap(), Some(vec![i]));
+        }
+    }
+
+    #[test]
+    fn key_multiple_max_length_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Two full-length (256-byte) segments at different trie depths.
+        let seg_a = vec![0xAAu8; MAX_SEG_LEN];
+        let seg_b = vec![0xBBu8; MAX_SEG_LEN];
+        t.insert(&[&seg_a, &seg_b], b"deep_max").unwrap();
+
+        assert_eq!(
+            t.get(&[&seg_a, &seg_b]).unwrap(),
+            Some(b"deep_max".to_vec())
+        );
+        assert_eq!(t.get(&[&seg_a]).unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Value variety tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn value_zero_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        t.insert(&[b"k"], b"").unwrap();
+        assert_eq!(t.get(&[b"k"]).unwrap(), Some(vec![]));
+        assert!(t.contains_key(&[b"k"]).unwrap());
+    }
+
+    #[test]
+    fn value_single_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        t.insert(&[b"k"], &[0x42]).unwrap();
+        assert_eq!(t.get(&[b"k"]).unwrap(), Some(vec![0x42]));
+    }
+
+    #[test]
+    fn value_max_length_u16_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let big: Vec<u8> = (0..u16::MAX as usize).map(|i| (i % 251) as u8).collect();
+        t.insert(&[b"big"], &big).unwrap();
+        assert_eq!(t.get(&[b"big"]).unwrap(), Some(big));
+    }
+
+    #[test]
+    fn value_all_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let zeros = vec![0u8; 128];
+        t.insert(&[b"z"], &zeros).unwrap();
+        assert_eq!(t.get(&[b"z"]).unwrap(), Some(zeros));
+    }
+
+    #[test]
+    fn value_all_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let maxbytes = vec![0xFFu8; 128];
+        t.insert(&[b"ff"], &maxbytes).unwrap();
+        assert_eq!(t.get(&[b"ff"]).unwrap(), Some(maxbytes));
+    }
+
+    #[test]
+    fn value_binary_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Deliberately invalid UTF-8 sequence.
+        let binary: Vec<u8> = (0u8..=255).collect();
+        t.insert(&[b"bin"], &binary).unwrap();
+        assert_eq!(t.get(&[b"bin"]).unwrap(), Some(binary));
+    }
+
+    #[test]
+    fn value_overwrite_larger() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        t.insert(&[b"k"], b"short").unwrap();
+        let long_val: Vec<u8> = vec![0xABu8; 1000];
+        t.insert(&[b"k"], &long_val).unwrap();
+        assert_eq!(t.get(&[b"k"]).unwrap(), Some(long_val));
+    }
+
+    #[test]
+    fn value_overwrite_smaller() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let long_val: Vec<u8> = vec![0xCDu8; 1000];
+        t.insert(&[b"k"], &long_val).unwrap();
+        t.insert(&[b"k"], b"tiny").unwrap();
+        assert_eq!(t.get(&[b"k"]).unwrap(), Some(b"tiny".to_vec()));
+    }
+
+    #[test]
+    fn value_multiple_sizes_same_trie() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let sizes: &[usize] = &[0, 1, 10, 100, 1000, 10_000, 60_000];
+        for &sz in sizes {
+            let v: Vec<u8> = (0..sz).map(|i| (i % 200) as u8).collect();
+            let key = sz.to_be_bytes();
+            t.insert(&[&key], &v).unwrap();
+        }
+        for &sz in sizes {
+            let v: Vec<u8> = (0..sz).map(|i| (i % 200) as u8).collect();
+            let key = sz.to_be_bytes();
+            assert_eq!(t.get(&[&key]).unwrap(), Some(v), "size={sz}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TrieKey variety tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn triekey_path_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let k1 = PathKey("usr/local/bin".into());
+        let k2 = PathKey("usr/local/lib".into());
+        let k3 = PathKey("usr/share".into());
+
+        t.insert_key(&k1, b"bin_val").unwrap();
+        t.insert_key(&k2, b"lib_val").unwrap();
+        t.insert_key(&k3, b"share_val").unwrap();
+
+        assert_eq!(t.get_key(&k1).unwrap(), Some(b"bin_val".to_vec()));
+        assert_eq!(t.get_key(&k2).unwrap(), Some(b"lib_val".to_vec()));
+        assert_eq!(t.get_key(&k3).unwrap(), Some(b"share_val".to_vec()));
+        assert!(t.contains_key_t(&k1).unwrap());
+
+        // prefix_scan_key for "usr/local" must find k1 and k2 only.
+        let prefix = PathKey("usr/local".into());
+        let mut results = t.prefix_scan_key(&prefix).unwrap();
+        assert_eq!(results.len(), 2, "expected exactly 2 under usr/local");
+        results.sort_by_key(|r| r.1.clone());
+        assert_eq!(results[0].1, b"bin_val");
+        assert_eq!(results[1].1, b"lib_val");
+
+        t.delete_key(&k1).unwrap();
+        assert!(!t.contains_key_t(&k1).unwrap());
+    }
+
+    #[test]
+    fn triekey_domain_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let d1 = domain_key("www.example.com");   // → ["com","example","www"]
+        let d2 = domain_key("mail.example.com");   // → ["com","example","mail"]
+        let d3 = domain_key("www.other.org");      // → ["org","other","www"]
+
+        t.insert_key(&d1, b"www").unwrap();
+        t.insert_key(&d2, b"mail").unwrap();
+        t.insert_key(&d3, b"other").unwrap();
+
+        assert_eq!(t.get_key(&d1).unwrap(), Some(b"www".to_vec()));
+        assert_eq!(t.get_key(&d2).unwrap(), Some(b"mail".to_vec()));
+        assert_eq!(t.get_key(&d3).unwrap(), Some(b"other".to_vec()));
+
+        // prefix_scan for "example.com" (→ ["com","example"]) must find d1 and d2.
+        let prefix = domain_key("example.com");
+        let results = t.prefix_scan_key(&prefix).unwrap();
+        assert_eq!(results.len(), 2, "expected 2 under example.com");
+
+        // Deleting d2 must not affect d1 or d3.
+        t.delete_key(&d2).unwrap();
+        assert_eq!(t.get_key(&d1).unwrap(), Some(b"www".to_vec()));
+        assert_eq!(t.get_key(&d3).unwrap(), Some(b"other".to_vec()));
+        assert_eq!(t.get_key(&d2).unwrap(), None);
+    }
+
+    #[test]
+    fn triekey_numeric_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let k1 = NumericKey(vec![0, 1, 2]);
+        let k2 = NumericKey(vec![0, 1, 3]);
+        let k3 = NumericKey(vec![0, 2]);
+        let k4 = NumericKey(vec![u32::MAX, u32::MAX]);
+
+        t.insert_key(&k1, b"0-1-2").unwrap();
+        t.insert_key(&k2, b"0-1-3").unwrap();
+        t.insert_key(&k3, b"0-2").unwrap();
+        t.insert_key(&k4, b"max-max").unwrap();
+
+        assert_eq!(t.get_key(&k1).unwrap(), Some(b"0-1-2".to_vec()));
+        assert_eq!(t.get_key(&k2).unwrap(), Some(b"0-1-3".to_vec()));
+        assert_eq!(t.get_key(&k3).unwrap(), Some(b"0-2".to_vec()));
+        assert_eq!(t.get_key(&k4).unwrap(), Some(b"max-max".to_vec()));
+
+        // Prefix [0, 1] covers k1 and k2 only.
+        let prefix = NumericKey(vec![0, 1]);
+        let results = t.prefix_scan_key(&prefix).unwrap();
+        assert_eq!(results.len(), 2, "expected 2 under [0,1]");
+
+        t.delete_key(&k4).unwrap();
+        assert_eq!(t.get_key(&k4).unwrap(), None);
+        assert_eq!(t.len().unwrap(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stress tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stress_large_200_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Insert 200 keys with 1-3 segments each.
+        let mut rng = 0xDEAD_BEEF_1234_5678u64;
+        let mut keys: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+
+        for _ in 0..200 {
+            let n_segs = (lcg(&mut rng) % 3 + 1) as usize;
+            let segs: Vec<Vec<u8>> = (0..n_segs)
+                .map(|_| {
+                    let len = (lcg(&mut rng) % 8 + 1) as usize;
+                    (0..len).map(|_| lcg(&mut rng) as u8).collect()
+                })
+                .collect();
+            let vlen = (lcg(&mut rng) % 64 + 1) as usize;
+            let val: Vec<u8> = (0..vlen).map(|_| lcg(&mut rng) as u8).collect();
+            keys.push(segs);
+            values.push(val);
+        }
+
+        // Build a reference model (last write wins for duplicate keys).
+        use std::collections::HashMap;
+        let mut model: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        for (segs, val) in keys.iter().zip(values.iter()) {
+            let refs: Vec<&[u8]> = segs.iter().map(|s| s.as_slice()).collect();
+            t.insert(&refs, val).unwrap();
+            model.insert(model_key(segs), val.clone());
+        }
+
+        // Verify via model — avoids false failures when duplicate keys were generated.
+        for (mkey, val) in &model {
+            let mut cursor = mkey.as_slice();
+            let mut segs: Vec<Vec<u8>> = Vec::new();
+            while !cursor.is_empty() {
+                let len = u16::from_le_bytes([cursor[0], cursor[1]]) as usize;
+                cursor = &cursor[2..];
+                segs.push(cursor[..len].to_vec());
+                cursor = &cursor[len..];
+            }
+            let refs: Vec<&[u8]> = segs.iter().map(|s| s.as_slice()).collect();
+            assert_eq!(t.get(&refs).unwrap().as_ref(), Some(val));
+        }
+    }
+
+    #[test]
+    fn stress_model_based_randomized() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+        let mut model: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut rng = 0xC0FFEE_0000_0001u64;
+
+        let n_ops = 500usize;
+
+        for _ in 0..n_ops {
+            let op = lcg(&mut rng) % 3;
+            let n_segs = (lcg(&mut rng) % 3 + 1) as usize;
+            let segs: Vec<Vec<u8>> = (0..n_segs)
+                .map(|_| {
+                    let len = (lcg(&mut rng) % 4 + 1) as usize;
+                    // Small alphabet (0..4) maximises structural sharing / conflicts.
+                    (0..len).map(|_| (lcg(&mut rng) % 4) as u8).collect()
+                })
+                .collect();
+            let mkey = model_key(&segs);
+            let refs: Vec<&[u8]> = segs.iter().map(|s| s.as_slice()).collect();
+
+            match op {
+                0 => {
+                    // INSERT
+                    let vlen = (lcg(&mut rng) % 16 + 1) as usize;
+                    let val: Vec<u8> = (0..vlen).map(|_| lcg(&mut rng) as u8).collect();
+                    t.insert(&refs, &val).unwrap();
+                    model.insert(mkey, val);
+                }
+                1 => {
+                    // DELETE
+                    t.delete(&refs).unwrap();
+                    model.remove(&mkey);
+                }
+                _ => {
+                    // GET — cross-check with model.
+                    let got = t.get(&refs).unwrap();
+                    let expected = model.get(&mkey).cloned();
+                    assert_eq!(got, expected, "model divergence on GET segs={segs:?}");
+                }
+            }
+        }
+
+        // Final full consistency check.
+        for (mkey, val) in &model {
+            // Decode mkey back to segments.
+            let mut cursor = mkey.as_slice();
+            let mut segs: Vec<Vec<u8>> = Vec::new();
+            while !cursor.is_empty() {
+                let len = u16::from_le_bytes([cursor[0], cursor[1]]) as usize;
+                cursor = &cursor[2..];
+                segs.push(cursor[..len].to_vec());
+                cursor = &cursor[len..];
+            }
+            let refs: Vec<&[u8]> = segs.iter().map(|s| s.as_slice()).collect();
+            assert_eq!(t.get(&refs).unwrap().as_ref(), Some(val));
+        }
+
+        // entry_count must match the model size.
+        assert_eq!(t.len().unwrap(), model.len() as u64);
+    }
+
+    #[test]
+    fn stress_deep_and_wide_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Wide: 20 single-segment keys at root level.
+        for i in 0u8..20 {
+            t.insert(&[&[i]], &[i, i]).unwrap();
+        }
+        // Deep: one 10-segment path.
+        let deep: Vec<Vec<u8>> = (0u8..10).map(|i| vec![0xF0u8, i]).collect();
+        let deep_refs: Vec<&[u8]> = deep.iter().map(|s| s.as_slice()).collect();
+        t.insert(&deep_refs, b"deep_leaf").unwrap();
+
+        // Verify wide keys.
+        for i in 0u8..20 {
+            assert_eq!(t.get(&[&[i]]).unwrap(), Some(vec![i, i]));
+        }
+        // Verify deep key.
+        assert_eq!(t.get(&deep_refs).unwrap(), Some(b"deep_leaf".to_vec()));
+
+        // Delete half the wide keys and re-verify.
+        for i in (0u8..20).step_by(2) {
+            t.delete(&[&[i]]).unwrap();
+        }
+        for i in 0u8..20 {
+            let expected = if i % 2 == 0 { None } else { Some(vec![i, i]) };
+            assert_eq!(t.get(&[&[i]]).unwrap(), expected);
+        }
+        // Deep key still intact.
+        assert_eq!(t.get(&deep_refs).unwrap(), Some(b"deep_leaf".to_vec()));
+    }
+
+    #[test]
+    fn stress_concurrent_readers_writers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let t = Arc::new(MappedVarTrie::open(&dir.path().join("trie.db")).unwrap());
+
+        // Pre-insert 50 known keys.
+        for i in 0u8..50 {
+            t.insert(&[&[i]], &[i]).unwrap();
+        }
+
+        let t_clone = Arc::clone(&t);
+        let writer = thread::spawn(move || {
+            // Overwrite all 50 keys with new values.
+            for i in 0u8..50 {
+                t_clone.insert(&[&[i]], &[i, i]).unwrap();
+            }
+            // Delete even-indexed keys.
+            for i in (0u8..50).step_by(2) {
+                t_clone.delete(&[&[i]]).unwrap();
+            }
+        });
+
+        let t_reader = Arc::clone(&t);
+        let reader = thread::spawn(move || {
+            // Read all keys repeatedly; we only assert no panics/errors.
+            for _ in 0..10 {
+                for i in 0u8..50 {
+                    let _ = t_reader.get(&[&[i]]).unwrap();
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // After writer finishes: odd keys must have value [i, i]; even keys deleted.
+        for i in 0u8..50 {
+            if i % 2 == 0 {
+                assert_eq!(t.get(&[&[i]]).unwrap(), None, "even key {i} should be deleted");
+            } else {
+                assert_eq!(
+                    t.get(&[&[i]]).unwrap(),
+                    Some(vec![i, i]),
+                    "odd key {i} should have updated value"
+                );
+            }
+        }
+    }
 }
