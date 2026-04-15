@@ -299,18 +299,28 @@ impl TrieInner {
         let root_page = self.store.header()?.root_page;
         let mut current_page = root_page;
 
-        // Track the path as (host_page, slot_index_in_host) pairs so we can
-        // remove child slots when pruning.
+        // Track the path so we can remove child slots and compact overflow
+        // chains when pruning upward.
+        //
+        // `depth_primary` is the first page at that depth (the one reached
+        // by following a child slot from the parent).  `host_page` is the
+        // page within the overflow chain that actually holds the matching
+        // child slot — it equals `depth_primary` unless the key lives in an
+        // overflow page.  Using `depth_primary` for `maybe_compact_overflow`
+        // ensures we compact the chain that *contains* the (now potentially
+        // empty) overflow page, not the overflow page itself.
         struct PathStep {
+            depth_primary: u64,
             host_page: u64,
             slot_idx: usize,
         }
         let mut path: Vec<PathStep> = Vec::new();
 
         for &segment in segments {
+            let depth_primary = current_page;
             match Self::find_child_detail(&self.store, current_page, segment)? {
                 Some((host_page, slot_idx, child_page)) => {
-                    path.push(PathStep { host_page, slot_idx });
+                    path.push(PathStep { depth_primary, host_page, slot_idx });
                     current_page = child_page;
                 }
                 None => return Ok(()), // key not present
@@ -341,15 +351,18 @@ impl TrieInner {
             let total_children =
                 Self::count_children_total(&self.store, page_to_prune)?;
             if pruned_node.flags & FLAG_HAS_VALUE == 0 && total_children == 0 {
-                // Empty — remove its slot from the parent host page.
+                // Remove the child slot from the host page.
                 let mut host_node = self.store.read_node(step.host_page)?;
                 host_node.children.remove(step.slot_idx);
-                // If host had FLAG_OVERFLOW and now no longer needs it,
-                // check if overflow chain is empty and unlink it.
                 self.store.write_node(step.host_page, &host_node)?;
-                self.maybe_compact_overflow(step.host_page)?;
+                // Compact the overflow chain rooted at depth_primary.
+                // This handles the case where host_page is itself an overflow
+                // page: if it's now empty it will be trimmed from the chain.
+                self.maybe_compact_overflow(step.depth_primary)?;
+                // Free the pruned node (and its own overflow chain, if any).
                 self.free_trie_node(page_to_prune)?;
-                page_to_prune = step.host_page;
+                // Walk up to the depth-primary for the next pruning check.
+                page_to_prune = step.depth_primary;
             } else {
                 break; // parent still has data; stop pruning
             }
@@ -358,16 +371,23 @@ impl TrieInner {
         Ok(())
     }
 
-    /// Removes any trailing empty overflow pages from the chain at `start_page`
-    /// and clears `FLAG_OVERFLOW` if the chain becomes empty.
+    /// Removes trailing empty overflow pages from the chain rooted at
+    /// `start_page` and clears `FLAG_OVERFLOW` when the chain becomes empty.
+    ///
+    /// # Double-free safety
+    ///
+    /// The chain is re-linked (setting the last kept page's `overflow_page`
+    /// to `NULL_PAGE`) **before** any page is freed.  Then each page to be
+    /// freed has its own `overflow_page` zeroed before `free_trie_node` is
+    /// called, so `free_overflow_chain` inside `free_trie_node` sees a null
+    /// chain and does not re-add already-freed pages.
     fn maybe_compact_overflow(&mut self, start_page: u64) -> Result<()> {
-        // Walk to find the first non-empty overflow page.
         let primary = self.store.read_node(start_page)?;
         if primary.overflow_page == NULL_PAGE {
             return Ok(());
         }
 
-        // Collect overflow pages in order.
+        // Collect the full overflow chain.
         let mut chain: Vec<u64> = Vec::new();
         let mut p = primary.overflow_page;
         while p != NULL_PAGE {
@@ -376,38 +396,51 @@ impl TrieInner {
             p = n.overflow_page;
         }
 
-        // Trim empty pages from the tail.
-        while let Some(&last) = chain.last() {
-            let n = self.store.read_node(last)?;
+        // Determine how many pages to keep (trim empty tail pages).
+        let mut keep = chain.len();
+        for &page in chain.iter().rev() {
+            let n = self.store.read_node(page)?;
             if n.children.is_empty() && n.flags & FLAG_HAS_VALUE == 0 {
-                chain.pop();
-                self.free_trie_node(last)?;
+                keep -= 1;
             } else {
                 break;
             }
         }
 
-        // Re-link the primary node.
-        let mut node = self.store.read_node(start_page)?;
-        if chain.is_empty() {
+        if keep == chain.len() {
+            return Ok(()); // nothing to trim
+        }
+
+        let to_free = chain[keep..].to_vec();
+
+        // Re-link first: sever the tail from the kept chain, then update
+        // start_page.  After this the freed pages are unreachable on disk.
+        if keep == 0 {
+            let mut node = self.store.read_node(start_page)?;
             node.overflow_page = NULL_PAGE;
             node.flags &= !FLAG_OVERFLOW;
+            self.store.write_node(start_page, &node)?;
         } else {
-            node.overflow_page = chain[0];
-            node.flags |= FLAG_OVERFLOW;
-            // Re-link remaining chain pages.
-            for i in 0..chain.len() {
-                let mut cn = self.store.read_node(chain[i])?;
-                cn.overflow_page = if i + 1 < chain.len() { chain[i + 1] } else { NULL_PAGE };
-                if i + 1 < chain.len() {
-                    cn.flags |= FLAG_OVERFLOW;
-                } else {
-                    cn.flags &= !FLAG_OVERFLOW;
-                }
-                self.store.write_node(chain[i], &cn)?;
-            }
+            // Update the last kept page to terminate the chain.
+            let last_kept = chain[keep - 1];
+            let mut lk = self.store.read_node(last_kept)?;
+            lk.overflow_page = NULL_PAGE;
+            lk.flags &= !FLAG_OVERFLOW;
+            self.store.write_node(last_kept, &lk)?;
+            // start_page.overflow_page is unchanged (still chain[0]).
         }
-        self.store.write_node(start_page, &node)?;
+
+        // Free each unlinked overflow page.  Zero its overflow_page first so
+        // free_overflow_chain (called by free_trie_node) sees a null chain and
+        // does not follow stale pointers into already-freed pages.
+        for &page in &to_free {
+            let mut n = self.store.read_node(page)?;
+            n.overflow_page = NULL_PAGE;
+            n.flags &= !FLAG_OVERFLOW;
+            self.store.write_node(page, &n)?;
+            self.free_trie_node(page)?;
+        }
+
         Ok(())
     }
 
@@ -1215,5 +1248,624 @@ mod tests {
         assert!(t.contains_key_t(&key).unwrap());
         t.delete_key(&key).unwrap();
         assert!(!t.contains_key_t(&key).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow — intermediate node
+    // -----------------------------------------------------------------------
+
+    /// Overflow at a non-root intermediate node (shared prefix at depth 1).
+    #[test]
+    fn overflow_at_intermediate_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // All keys share the first segment "p"; the "p" node gets >15 children.
+        let n = MAX_CHILDREN + 4;
+        for i in 0..n {
+            t.insert(&[b"p", &[i as u8]], &[i as u8]).unwrap();
+        }
+
+        // Every key is readable.
+        for i in 0..n {
+            assert_eq!(
+                t.get(&[b"p", &[i as u8]]).unwrap(),
+                Some(vec![i as u8]),
+                "intermediate-overflow key p/{i} missing"
+            );
+        }
+
+        // The "p" node must have FLAG_OVERFLOW.
+        {
+            let inner = t.inner.lock().unwrap();
+            let root = inner.store.read_node(1).unwrap();
+            assert_eq!(root.children.len(), 1, "root should have exactly one child (p)");
+            let p_node = inner.store.read_node(root.children[0].child_page).unwrap();
+            assert!(p_node.is_overflow(), "intermediate 'p' node should overflow");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow — three pages (>30 children)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overflow_three_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // 3*MAX_CHILDREN + 2 = 47 keys → 4 pages in the chain (15+15+15+2)
+        let n = 3 * MAX_CHILDREN + 2;
+        for i in 0..n {
+            // Use two-byte segments to avoid collisions when n > 255.
+            let seg = (i as u16).to_le_bytes();
+            t.insert(&[seg.as_ref()], &[i as u8]).unwrap();
+        }
+
+        // All keys readable.
+        for i in 0..n {
+            let seg = (i as u16).to_le_bytes();
+            let val = t.get(&[seg.as_ref()]).unwrap();
+            assert_eq!(val, Some(vec![i as u8]), "key {i} missing in 3-page overflow");
+        }
+
+        assert_eq!(t.len().unwrap(), n as u64);
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow — delete causes chain compaction
+    // -----------------------------------------------------------------------
+
+    /// Deleting the single key stored in an overflow page should compact the
+    /// chain: the terminal child is pruned, the overflow page becomes empty
+    /// and is trimmed, and the primary node's FLAG_OVERFLOW is cleared.
+    #[test]
+    fn overflow_chain_compacted_on_last_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // MAX_CHILDREN + 1 keys → root overflow_page has exactly one child.
+        let n = MAX_CHILDREN + 1;
+        for i in 0..n {
+            t.insert(&[&[i as u8]], &[i as u8]).unwrap();
+        }
+
+        // Delete the key stored in the overflow page.
+        let overflow_key = (n - 1) as u8;
+        t.delete(&[&[overflow_key]]).unwrap();
+
+        // Overflow page and the terminal node for overflow_key were both
+        // pruned; the root should have no overflow chain left.
+        {
+            let inner = t.inner.lock().unwrap();
+            let root = inner.store.read_node(1).unwrap();
+            assert!(
+                !root.is_overflow(),
+                "FLAG_OVERFLOW should be cleared after overflow page is emptied"
+            );
+            assert_eq!(root.overflow_page, 0, "overflow_page should be NULL after compaction");
+            // The root's GC list should now contain the freed pages.
+            let hdr = inner.store.header().unwrap();
+            assert_ne!(hdr.empty_node_head, 0, "GC list should have freed pages");
+        }
+
+        // The remaining keys should all still be accessible.
+        for i in 0..(n - 1) {
+            assert_eq!(
+                t.get(&[&[i as u8]]).unwrap(),
+                Some(vec![i as u8]),
+                "key {i} should survive after overflow compaction"
+            );
+        }
+        assert_eq!(t.get(&[&[overflow_key]]).unwrap(), None);
+    }
+
+    /// Delete all children from TWO consecutive overflow pages; verifies the
+    /// double-free-safe compaction path (the original bug).
+    #[test]
+    fn overflow_compact_two_tail_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Insert 2*MAX_CHILDREN + 2 keys → root has 3 pages in overflow chain.
+        let n = 2 * MAX_CHILDREN + 2;
+        for i in 0..n {
+            let seg = (i as u16).to_le_bytes();
+            t.insert(&[seg.as_ref()], &[i as u8]).unwrap();
+        }
+
+        // Delete the last MAX_CHILDREN + 2 keys (the last two overflow pages).
+        for i in MAX_CHILDREN..n {
+            let seg = (i as u16).to_le_bytes();
+            t.delete(&[seg.as_ref()]).unwrap();
+        }
+
+        // Root chain should now be compacted to a single overflow page (or none).
+        // Keys in the primary root page (0..MAX_CHILDREN-1) should still work.
+        for i in 0..MAX_CHILDREN {
+            let seg = (i as u16).to_le_bytes();
+            assert_eq!(
+                t.get(&[seg.as_ref()]).unwrap(),
+                Some(vec![i as u8]),
+                "key {i} should survive double-tail compaction"
+            );
+        }
+        assert_eq!(t.len().unwrap(), MAX_CHILDREN as u64);
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow — delete from overflow node in a deeper trie
+    // -----------------------------------------------------------------------
+
+    /// The key's path passes through an overflow page at an intermediate level.
+    /// After deletion the path is pruned and the overflow chain at that level
+    /// is compacted.
+    #[test]
+    fn overflow_delete_via_overflow_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Fill the root with MAX_CHILDREN + 1 children; the overflow page
+        // holds child MAX_CHILDREN.  Each child has its own terminal value.
+        let n = MAX_CHILDREN + 1;
+        for i in 0..n {
+            t.insert(&[&[i as u8]], &[i as u8]).unwrap();
+        }
+
+        // The overflow-page child also has sub-children to prevent pruning.
+        let overflow_child: u8 = (n - 1) as u8;
+        t.insert(&[&[overflow_child], b"sub"], b"sub_val").unwrap();
+
+        // Delete the terminal value of the overflow child (not the sub-child).
+        t.delete(&[&[overflow_child]]).unwrap();
+
+        // The overflow child should still exist (it has a sub-child).
+        assert_eq!(
+            t.get(&[&[overflow_child], b"sub"]).unwrap(),
+            Some(b"sub_val".to_vec())
+        );
+        // But its own value is gone.
+        assert_eq!(t.get(&[&[overflow_child]]).unwrap(), None);
+
+        // The overflow chain on the root should still exist (overflow_child
+        // node is not empty — it still has a sub-child).
+        {
+            let inner = t.inner.lock().unwrap();
+            let root = inner.store.read_node(1).unwrap();
+            assert!(root.is_overflow(), "overflow chain should still exist");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty-node GC — persistence across reopen
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gc_list_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Insert then delete so the GC list is non-empty.
+        {
+            let t = open(&dir);
+            t.insert(&[b"x"], b"v").unwrap();
+            t.delete(&[b"x"]).unwrap();
+        }
+
+        // After reopen the GC list head should still be set.
+        {
+            let t = reopen(&dir);
+            let inner = t.inner.lock().unwrap();
+            let hdr = inner.store.header().unwrap();
+            assert_ne!(hdr.empty_node_head, 0, "GC list head must persist across reopen");
+        }
+    }
+
+    #[test]
+    fn gc_list_multiple_entries_reused_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Insert 3 single-segment keys (each allocates one terminal page).
+        t.insert(&[b"a"], b"1").unwrap();
+        t.insert(&[b"b"], b"2").unwrap();
+        t.insert(&[b"c"], b"3").unwrap();
+
+        let pages_before = {
+            let inner = t.inner.lock().unwrap();
+            inner.store.header().unwrap().num_pages
+        };
+
+        // Delete all three — 3 terminal nodes + 3 "a/b/c" child nodes enter GC.
+        t.delete(&[b"a"]).unwrap();
+        t.delete(&[b"b"]).unwrap();
+        t.delete(&[b"c"]).unwrap();
+
+        // Each single-segment key allocates exactly one node (the child is also
+        // the terminal), so deleting 3 keys leaves 3 nodes in the GC list.
+        let gc_count_after_delete = {
+            let inner = t.inner.lock().unwrap();
+            let mut count = 0u32;
+            let hdr = inner.store.header().unwrap();
+            let mut p = hdr.empty_node_head;
+            while p != 0 {
+                count += 1;
+                let n = inner.store.read_node(p).unwrap();
+                p = n.value_offset; // next pointer
+                assert!(count < 100, "GC list cycle detected");
+            }
+            count
+        };
+        assert_eq!(gc_count_after_delete, 3, "3 child/terminal nodes should be in GC");
+
+        // Re-inserting 3 new keys should reuse GC pages without growing file.
+        t.insert(&[b"d"], b"4").unwrap();
+        t.insert(&[b"e"], b"5").unwrap();
+        t.insert(&[b"f"], b"6").unwrap();
+
+        let pages_after_reinsert = {
+            let inner = t.inner.lock().unwrap();
+            inner.store.header().unwrap().num_pages
+        };
+        assert_eq!(pages_before, pages_after_reinsert, "file should not grow when GC list has entries");
+    }
+
+    // -----------------------------------------------------------------------
+    // Deep path pruning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deep_path_pruning_frees_all_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // 10-segment key → allocates one node per segment level.
+        let segs: [&[u8]; 10] = [
+            b"s0", b"s1", b"s2", b"s3", b"s4",
+            b"s5", b"s6", b"s7", b"s8", b"s9",
+        ];
+        t.insert(&segs, b"deep").unwrap();
+
+        let pages_after_insert = {
+            let inner = t.inner.lock().unwrap();
+            inner.store.header().unwrap().num_pages
+        };
+
+        t.delete(&segs).unwrap();
+
+        // GC list should now be non-empty.
+        {
+            let inner = t.inner.lock().unwrap();
+            let hdr = inner.store.header().unwrap();
+            assert_ne!(hdr.empty_node_head, 0, "GC list must be non-empty after deep pruning");
+            // entry_count should be 0.
+            assert_eq!(hdr.entry_count, 0);
+        }
+
+        // Inserting the same key again must succeed and reuse GC pages.
+        t.insert(&segs, b"reborn").unwrap();
+        let pages_after_reinsert = {
+            let inner = t.inner.lock().unwrap();
+            inner.store.header().unwrap().num_pages
+        };
+        assert_eq!(
+            pages_after_insert, pages_after_reinsert,
+            "re-inserting a pruned deep key should reuse GC nodes"
+        );
+        assert_eq!(t.get(&segs).unwrap(), Some(b"reborn".to_vec()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Root-level value does not affect child pruning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn root_value_prevents_root_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Insert value at root and at a child.
+        t.insert(&[], b"root_v").unwrap();
+        t.insert(&[b"child"], b"child_v").unwrap();
+
+        // Delete only the child — root still has its value, not pruned.
+        t.delete(&[b"child"]).unwrap();
+
+        assert_eq!(t.get(&[]).unwrap(), Some(b"root_v".to_vec()));
+        assert_eq!(t.len().unwrap(), 1);
+
+        // Delete root value too.
+        t.delete(&[]).unwrap();
+        assert_eq!(t.get(&[]).unwrap(), None);
+        assert_eq!(t.len().unwrap(), 0);
+
+        // Root page is always page 1 — must never be in the GC list.
+        {
+            let inner = t.inner.lock().unwrap();
+            let hdr = inner.store.header().unwrap();
+            let mut p = hdr.empty_node_head;
+            while p != 0 {
+                assert_ne!(p, 1, "root page must never be in the GC list");
+                let n = inner.store.read_node(p).unwrap();
+                p = n.value_offset;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Contains and len with overflow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn contains_key_finds_all_overflow_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let n = MAX_CHILDREN + 6;
+        for i in 0..n {
+            t.insert(&[&[i as u8]], &[i as u8]).unwrap();
+        }
+
+        for i in 0..n {
+            assert!(t.contains_key(&[&[i as u8]]).unwrap(), "key {i} not found");
+        }
+        assert!(!t.contains_key(&[&[n as u8]]).unwrap());
+    }
+
+    #[test]
+    fn len_tracks_overflow_inserts_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let n = MAX_CHILDREN + 3;
+        for i in 0..n {
+            t.insert(&[&[i as u8]], &[i as u8]).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), n as u64);
+
+        // Delete keys in the overflow range.
+        for i in MAX_CHILDREN..n {
+            t.delete(&[&[i as u8]]).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), MAX_CHILDREN as u64);
+
+        // Re-insert them.
+        for i in MAX_CHILDREN..n {
+            t.insert(&[&[i as u8]], &[i as u8]).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), n as u64);
+    }
+
+    #[test]
+    fn len_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let t = open(&dir);
+            t.insert(&[b"a"], b"1").unwrap();
+            t.insert(&[b"b"], b"2").unwrap();
+            t.insert(&[b"c"], b"3").unwrap();
+            t.delete(&[b"b"]).unwrap();
+        }
+
+        let t = reopen(&dir);
+        assert_eq!(t.len().unwrap(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefix scan — thorough
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prefix_scan_includes_prefix_endpoint_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // The prefix endpoint itself has a value.
+        t.insert(&[b"root"], b"root_val").unwrap();
+        t.insert(&[b"root", b"child1"], b"c1_val").unwrap();
+        t.insert(&[b"root", b"child2"], b"c2_val").unwrap();
+
+        let results = t.prefix_scan(&[b"root"]).unwrap();
+        assert_eq!(results.len(), 3, "scan should include the prefix endpoint itself");
+
+        let values: Vec<&[u8]> = results.iter().map(|(_, v)| v.as_slice()).collect();
+        assert!(values.contains(&b"root_val".as_ref()));
+        assert!(values.contains(&b"c1_val".as_ref()));
+        assert!(values.contains(&b"c2_val".as_ref()));
+    }
+
+    #[test]
+    fn prefix_scan_with_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // All keys share the prefix [b"pre"] and have distinct second segments,
+        // causing the "pre" node to overflow.
+        let n = MAX_CHILDREN + 3;
+        for i in 0..n {
+            t.insert(&[b"pre", &[i as u8]], &[i as u8]).unwrap();
+        }
+
+        let results = t.prefix_scan(&[b"pre"]).unwrap();
+        assert_eq!(results.len(), n, "prefix scan should find all overflow children");
+
+        // All segments should be present.
+        let mut found: Vec<u8> = results.iter().map(|(segs, _)| segs[1][0]).collect();
+        found.sort_unstable();
+        let expected: Vec<u8> = (0..n as u8).collect();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn prefix_scan_deeply_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        t.insert(&[b"a", b"b", b"c"], b"abc").unwrap();
+        t.insert(&[b"a", b"b", b"d"], b"abd").unwrap();
+        t.insert(&[b"a", b"x"], b"ax").unwrap();
+
+        // Scan from "a/b" — should only see abc and abd.
+        let results = t.prefix_scan(&[b"a", b"b"]).unwrap();
+        assert_eq!(results.len(), 2);
+        let mut vals: Vec<Vec<u8>> = results.into_iter().map(|(_, v)| v).collect();
+        vals.sort();
+        assert_eq!(vals, vec![b"abc".to_vec(), b"abd".to_vec()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Overwrite does not double-count in len
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overwrite_in_overflow_does_not_double_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        let n = MAX_CHILDREN + 2;
+        for i in 0..n {
+            t.insert(&[&[i as u8]], &[i as u8]).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), n as u64);
+
+        // Overwrite a key in the overflow range — len must stay the same.
+        let overflow_key = (n - 1) as u8;
+        t.insert(&[&[overflow_key]], b"new_value").unwrap();
+        assert_eq!(t.len().unwrap(), n as u64);
+        assert_eq!(t.get(&[&[overflow_key]]).unwrap(), Some(b"new_value".to_vec()));
+    }
+
+    // -----------------------------------------------------------------------
+    // TrieKey prefix_scan_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prefix_scan_key_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        t.insert(&[b"a", b"b"], b"ab").unwrap();
+        t.insert(&[b"a", b"c"], b"ac").unwrap();
+
+        let prefix = StrKey(vec!["a".into()]);
+        let results = t.prefix_scan_key(&prefix).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // FileHeader version mismatch rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrong_version_rejected_on_reopen() {
+        use crate::node::{PAGE_SIZE, VERSION};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Create a valid trie.
+        MappedVarTrie::open(&path).unwrap();
+
+        // Manually corrupt the version field (at byte offset 4..6 in page 0).
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            // Rebuild header with version = VERSION + 1.
+            let mut hdr_page = [0u8; PAGE_SIZE];
+            f.seek(SeekFrom::Start(0)).unwrap();
+            std::io::Read::read_exact(&mut f, &mut hdr_page).unwrap();
+
+            // Decode, bump version, re-encode.
+            // We write raw bytes: version is at [4..6].
+            let bad_version = (VERSION + 1).to_le_bytes();
+            hdr_page[4..6].copy_from_slice(&bad_version);
+            // Recompute CRC (covers [0..48]).
+            let new_crc = crc32fast::hash(&hdr_page[..48]);
+            hdr_page[48..52].copy_from_slice(&new_crc.to_le_bytes());
+
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&hdr_page).unwrap();
+        }
+
+        let result = MappedVarTrie::open(&path);
+        assert!(result.is_err(), "opening a file with wrong version should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stress: many inserts, deletes, re-inserts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stress_insert_delete_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir);
+
+        // Round 1: insert 40 keys.
+        for i in 0u8..40 {
+            t.insert(&[&[i]], &[i]).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), 40);
+
+        // Round 2: delete all.
+        for i in 0u8..40 {
+            t.delete(&[&[i]]).unwrap();
+        }
+        assert_eq!(t.len().unwrap(), 0);
+
+        // Round 3: insert 40 different keys — should reuse GC pages.
+        let pages_before = {
+            let inner = t.inner.lock().unwrap();
+            inner.store.header().unwrap().num_pages
+        };
+        for i in 0u8..40 {
+            t.insert(&[&[100u8.wrapping_add(i)]], &[i]).unwrap();
+        }
+        let pages_after = {
+            let inner = t.inner.lock().unwrap();
+            inner.store.header().unwrap().num_pages
+        };
+        assert_eq!(pages_before, pages_after, "GC reuse should prevent file growth in round 3");
+        assert_eq!(t.len().unwrap(), 40);
+
+        // All round-3 keys accessible.
+        for i in 0u8..40 {
+            assert_eq!(
+                t.get(&[&[100u8.wrapping_add(i)]]).unwrap(),
+                Some(vec![i]),
+                "round-3 key missing"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL replay with overflow-causing insert
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wal_replay_overflow_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("trie.db");
+
+        // Fill root to MAX_CHILDREN so the next insert will trigger overflow.
+        {
+            let t = MappedVarTrie::open(&db_path).unwrap();
+            for i in 0..MAX_CHILDREN as u8 {
+                t.insert(&[&[i]], &[i]).unwrap();
+            }
+        }
+
+        // Leave a WAL for the overflow-causing insert.
+        let overflow_seg: u8 = MAX_CHILDREN as u8;
+        wal::write_insert(&db_path, &[&[overflow_seg]], &[overflow_seg]).unwrap();
+
+        // Replay should correctly add the overflow page.
+        let t = MappedVarTrie::open(&db_path).unwrap();
+        assert_eq!(
+            t.get(&[&[overflow_seg]]).unwrap(),
+            Some(vec![overflow_seg]),
+            "WAL replay should create overflow page"
+        );
+        assert_eq!(t.len().unwrap(), (MAX_CHILDREN + 1) as u64);
+        assert!(!wal::wal_path(&db_path).exists());
     }
 }
