@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
 license = "MIT"
+description = "A Rust library for memory-mapped variable-length key tries, optimized for fast lookups and efficient storage."
+repository = "https://github.com/williamwutq/mappedvartrie"
 
 [dependencies]
 memmap2 = "0.9"
