@@ -175,7 +175,7 @@ impl PageStore {
         FileHeader::from_page(bytes)
     }
 
-    fn write_header(&mut self, hdr: &FileHeader) -> Result<()> {
+    pub fn write_header(&mut self, hdr: &FileHeader) -> Result<()> {
         self.mmap[0..PAGE_SIZE].copy_from_slice(&hdr.to_page());
         Ok(())
     }

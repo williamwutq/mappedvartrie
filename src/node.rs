@@ -3,7 +3,7 @@
 //! # File layout
 //!
 //! ```text
-//! Page 0:  FileHeader (PAGE_SIZE bytes; first 36 bytes meaningful)
+//! Page 0:  FileHeader (PAGE_SIZE bytes; first 52 bytes meaningful)
 //! Page 1:  root trie node
 //! Page 2+: additional trie nodes or freed pages
 //! ```
@@ -16,14 +16,15 @@
 //! Offset  Size  Field
 //! 0       4     magic: u32  (NODE_MAGIC — identifies this as a trie node page)
 //! 4       4     crc32: u32  (CRC32 of the whole page with bytes [4..8] zeroed)
-//! 8       1     flags: u8   (FLAG_HAS_VALUE, FLAG_FREE, …)
+//! 8       1     flags: u8   (FLAG_HAS_VALUE, FLAG_OVERFLOW, FLAG_EMPTY_GC, FLAG_FREE)
 //! 9       1     _pad
 //! 10      2     n_children: u16
-//! 12      2     value_len: u16   (stub — always 0 in this version)
+//! 12      2     value_len: u16
 //! 14      2     _pad
-//! 16      8     value_offset: u64 (stub — always 0; repurposed as next_free
-//!                                  in freed pages)
-//! 24      266×n child slots (n ≤ MAX_CHILDREN = 15)
+//! 16      8     value_offset: u64  (heap offset; repurposed as next_empty when
+//!                                   FLAG_EMPTY_GC, and as next_free when FLAG_FREE)
+//! 24      8     overflow_page: u64 (next overflow node page, or NULL_PAGE)
+//! 32      266×n child slots (n ≤ MAX_CHILDREN = 15)
 //! ```
 //!
 //! # Child slot layout (266 bytes, tightly packed)
@@ -36,7 +37,22 @@
 //! ```
 //!
 //! Tight packing (no alignment padding on `child_page`) gives exactly 15 slots
-//! in a 4096-byte page: 24 + 15 × 266 = 4014 bytes, leaving 82 bytes unused.
+//! in a 4096-byte page: 32 + 15 × 266 = 4022 bytes, leaving 74 bytes unused.
+//!
+//! # Overflow linked list
+//!
+//! When all `MAX_CHILDREN` slots in a node are occupied and a new distinct
+//! segment arrives, rather than returning an error a fresh **overflow page** is
+//! allocated, linked via `overflow_page`, and `FLAG_OVERFLOW` is set on the
+//! parent.  The chain is traversed both during lookup and insertion.
+//!
+//! # Empty-node GC list
+//!
+//! When a trie node is pruned (zero children, no value), instead of immediately
+//! returning the page to the page-level free list it is added to a trie-level
+//! **empty-node reuse list** tracked by `FileHeader::empty_node_head`.  The
+//! next pointer is stored in the node's `value_offset` field (safe because
+//! `FLAG_EMPTY_GC` and `FLAG_HAS_VALUE` are mutually exclusive).
 //!
 //! # Freed page overlay
 //!
@@ -67,7 +83,7 @@ pub const FILE_MAGIC: u32 = u32::from_le_bytes(*b"MVTF");
 pub const NODE_MAGIC: u32 = u32::from_le_bytes(*b"MVTN");
 
 /// On-disk format version stored in the file header.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Maximum segment length in bytes.
 pub const MAX_SEG_LEN: usize = 256;
@@ -75,12 +91,12 @@ pub const MAX_SEG_LEN: usize = 256;
 /// Size of one child slot in bytes: `seg_len`(2) + `seg_bytes`(256) + `child_page`(8).
 pub const CHILD_SLOT_SIZE: usize = 2 + MAX_SEG_LEN + 8; // = 266
 
-/// Size of the node page header in bytes.
-pub const NODE_HDR_SIZE: usize = 24;
+/// Size of the node page header in bytes (includes `overflow_page` field).
+pub const NODE_HDR_SIZE: usize = 32;
 
 /// Maximum number of children per node page.
 ///
-/// `floor((PAGE_SIZE - NODE_HDR_SIZE) / CHILD_SLOT_SIZE)` = `floor(4072 / 266)` = 15.
+/// `floor((PAGE_SIZE - NODE_HDR_SIZE) / CHILD_SLOT_SIZE)` = `floor(4064 / 266)` = 15.
 pub const MAX_CHILDREN: usize = (PAGE_SIZE - NODE_HDR_SIZE) / CHILD_SLOT_SIZE;
 
 // Compile-time sanity checks.
@@ -96,14 +112,26 @@ pub const GROW_BATCH: u64 = 64;
 /// This node is a terminal: it holds a value at the end of a key.
 pub const FLAG_HAS_VALUE: u8 = 0x01;
 
+/// This node's `overflow_page` field points to a continuation page.
+pub const FLAG_OVERFLOW: u8 = 0x02;
+
+/// This node is in the trie-level empty-node reuse list.
+///
+/// The `value_offset` field holds the next pointer in the list.
+/// Mutually exclusive with [`FLAG_HAS_VALUE`].
+pub const FLAG_EMPTY_GC: u8 = 0x04;
+
 /// Sentinel flag stored in freed pages (not a valid live-node flag).
 pub const FLAG_FREE: u8 = 0xFF;
 
 // Byte offset of the CRC32 field within a node page.
 const CRC_OFFSET: usize = 4;
 
-// Byte offset of the `next_free` / `value_offset` field.
-const NEXT_FREE_OFFSET: usize = 16;
+// Byte offset of the `value_offset` / `next_free` / `next_empty` field.
+const VALUE_OFFSET_FIELD: usize = 16;
+
+// Byte offset of the `overflow_page` field.
+const OVERFLOW_PAGE_OFFSET: usize = 24;
 
 // ---------------------------------------------------------------------------
 // File header (page 0)
@@ -111,7 +139,7 @@ const NEXT_FREE_OFFSET: usize = 16;
 
 /// In-memory representation of the file header (page 0).
 ///
-/// Serialized to/from a full `PAGE_SIZE` byte array. Only the first 36 bytes
+/// Serialized to/from a full `PAGE_SIZE` byte array. Only the first 52 bytes
 /// contain meaningful data; the rest are zeroed padding.
 ///
 /// On-disk layout:
@@ -122,8 +150,10 @@ const NEXT_FREE_OFFSET: usize = 16;
 /// [8..16]  root_page:        u64
 /// [16..24] free_list_head:   u64
 /// [24..32] num_pages:        u64
-/// [32..36] header_crc32:     u32  (CRC32 of bytes [0..32])
-/// [36..4096] zeroed padding
+/// [32..40] empty_node_head:  u64  (head of the trie-level empty-node reuse list)
+/// [40..48] entry_count:      u64  (number of key-value pairs)
+/// [48..52] header_crc32:     u32  (CRC32 of bytes [0..48])
+/// [52..4096] zeroed padding
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct FileHeader {
@@ -135,13 +165,17 @@ pub struct FileHeader {
     pub free_list_head: u64,
     /// Total number of pages in the file (including the header page).
     pub num_pages: u64,
+    /// Head of the trie-level empty-node reuse list, or [`NULL_PAGE`] if empty.
+    pub empty_node_head: u64,
+    /// Number of key-value entries currently stored.
+    pub entry_count: u64,
 }
+
+// Bytes covered by the header CRC (everything before the CRC field itself).
+const HDR_CRC_COVER: usize = 48;
 
 impl FileHeader {
     /// Creates an initial header for a brand-new file.
-    ///
-    /// Sets `root_page = 1` (callers must initialize page 1 before using it)
-    /// and `num_pages = 1` (only the header page exists initially).
     pub fn new_empty() -> Self {
         FileHeader {
             magic: FILE_MAGIC,
@@ -149,12 +183,14 @@ impl FileHeader {
             root_page: NULL_PAGE,
             free_list_head: NULL_PAGE,
             num_pages: 1,
+            empty_node_head: NULL_PAGE,
+            entry_count: 0,
         }
     }
 
     /// Serializes to a full [`PAGE_SIZE`]-byte array.
     ///
-    /// CRC32 covers bytes [0..32] and is written at [32..36].
+    /// CRC32 covers bytes `[0..48]` and is written at `[48..52]`.
     pub fn to_page(&self) -> [u8; PAGE_SIZE] {
         let mut buf = [0u8; PAGE_SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -163,8 +199,10 @@ impl FileHeader {
         buf[8..16].copy_from_slice(&self.root_page.to_le_bytes());
         buf[16..24].copy_from_slice(&self.free_list_head.to_le_bytes());
         buf[24..32].copy_from_slice(&self.num_pages.to_le_bytes());
-        let crc = crc32fast::hash(&buf[..32]);
-        buf[32..36].copy_from_slice(&crc.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.empty_node_head.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.entry_count.to_le_bytes());
+        let crc = crc32fast::hash(&buf[..HDR_CRC_COVER]);
+        buf[48..52].copy_from_slice(&crc.to_le_bytes());
         buf
     }
 
@@ -176,9 +214,9 @@ impl FileHeader {
                 "bad file header magic: {magic:#010x} (expected {FILE_MAGIC:#010x})"
             )));
         }
-        // Verify CRC32: covers [0..32], stored at [32..36].
-        let stored_crc = u32::from_le_bytes(page[32..36].try_into().unwrap());
-        let computed_crc = crc32fast::hash(&page[..32]);
+        // Verify CRC32: covers [0..48], stored at [48..52].
+        let stored_crc = u32::from_le_bytes(page[48..52].try_into().unwrap());
+        let computed_crc = crc32fast::hash(&page[..HDR_CRC_COVER]);
         if stored_crc != computed_crc {
             return Err(TrieError::Corruption(format!(
                 "file header CRC32 mismatch: stored {stored_crc:#010x}, \
@@ -197,6 +235,8 @@ impl FileHeader {
             root_page: u64::from_le_bytes(page[8..16].try_into().unwrap()),
             free_list_head: u64::from_le_bytes(page[16..24].try_into().unwrap()),
             num_pages: u64::from_le_bytes(page[24..32].try_into().unwrap()),
+            empty_node_head: u64::from_le_bytes(page[32..40].try_into().unwrap()),
+            entry_count: u64::from_le_bytes(page[40..48].try_into().unwrap()),
         })
     }
 }
@@ -229,28 +269,32 @@ impl ChildSlot {
 // ---------------------------------------------------------------------------
 
 /// In-memory representation of one trie node page.
-///
-/// Values are out of scope for this version; `value_len` and `value_offset`
-/// are always 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrieNode {
-    /// Node flags.  Use [`FLAG_HAS_VALUE`] for terminal nodes.
+    /// Node flags.  Use [`FLAG_HAS_VALUE`] for terminal nodes,
+    /// [`FLAG_OVERFLOW`] when `overflow_page` is set,
+    /// [`FLAG_EMPTY_GC`] for nodes in the reuse list.
     pub flags: u8,
-    /// Byte length of the associated value in the external heap (stub: 0).
+    /// Byte length of the associated value in the external heap (0 when absent).
     pub value_len: u16,
-    /// Byte offset in the external value heap (stub: 0).
+    /// Byte offset in the external value heap; repurposed as:
+    /// - next-empty pointer when `FLAG_EMPTY_GC` is set
+    /// - next-free pointer when `FLAG_FREE` is set
     pub value_offset: u64,
+    /// Page index of the overflow continuation node, or [`NULL_PAGE`].
+    pub overflow_page: u64,
     /// Child edges, up to [`MAX_CHILDREN`].
     pub children: Vec<ChildSlot>,
 }
 
 impl TrieNode {
-    /// Creates a new, empty interior node (no value, no children).
+    /// Creates a new, empty interior node (no value, no children, no overflow).
     pub fn new() -> Self {
         TrieNode {
             flags: 0,
             value_len: 0,
             value_offset: 0,
+            overflow_page: NULL_PAGE,
             children: Vec::new(),
         }
     }
@@ -261,6 +305,7 @@ impl TrieNode {
             flags: FLAG_HAS_VALUE,
             value_len: 0,
             value_offset: 0,
+            overflow_page: NULL_PAGE,
             children: Vec::new(),
         }
     }
@@ -269,6 +314,12 @@ impl TrieNode {
     #[inline]
     pub fn is_terminal(&self) -> bool {
         self.flags & FLAG_HAS_VALUE != 0
+    }
+
+    /// Returns `true` if this node has an overflow continuation page.
+    #[inline]
+    pub fn is_overflow(&self) -> bool {
+        self.flags & FLAG_OVERFLOW != 0
     }
 
     /// Serializes this node to a 4096-byte page.
@@ -292,13 +343,16 @@ impl TrieNode {
 
         let mut buf = [0u8; PAGE_SIZE];
 
-        // Header fields (magic written below after CRC, crc field left 0 for now).
+        // Header fields (magic written below; crc field left 0 for CRC computation).
         buf[8] = self.flags;
         // [9]: _pad = 0
         buf[10..12].copy_from_slice(&(self.children.len() as u16).to_le_bytes());
         buf[12..14].copy_from_slice(&self.value_len.to_le_bytes());
         // [14..16]: _pad = 0
-        buf[16..24].copy_from_slice(&self.value_offset.to_le_bytes());
+        buf[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8]
+            .copy_from_slice(&self.value_offset.to_le_bytes());
+        buf[OVERFLOW_PAGE_OFFSET..OVERFLOW_PAGE_OFFSET + 8]
+            .copy_from_slice(&self.overflow_page.to_le_bytes());
 
         // Child slots at [NODE_HDR_SIZE ..]
         let mut off = NODE_HDR_SIZE;
@@ -354,7 +408,12 @@ impl TrieNode {
             )));
         }
         let value_len = u16::from_le_bytes(page[12..14].try_into().unwrap());
-        let value_offset = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        let value_offset = u64::from_le_bytes(
+            page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8].try_into().unwrap(),
+        );
+        let overflow_page = u64::from_le_bytes(
+            page[OVERFLOW_PAGE_OFFSET..OVERFLOW_PAGE_OFFSET + 8].try_into().unwrap(),
+        );
 
         let mut children = Vec::with_capacity(n_children);
         let mut off = NODE_HDR_SIZE;
@@ -376,7 +435,7 @@ impl TrieNode {
             off += CHILD_SLOT_SIZE;
         }
 
-        Ok(TrieNode { flags, value_len, value_offset, children })
+        Ok(TrieNode { flags, value_len, value_offset, overflow_page, children })
     }
 }
 
@@ -415,7 +474,7 @@ pub fn write_free_page(page: &mut [u8], next_free: u64) {
     page.fill(0);
     page[0..4].copy_from_slice(&NODE_MAGIC.to_le_bytes());
     page[8] = FLAG_FREE;
-    page[NEXT_FREE_OFFSET..NEXT_FREE_OFFSET + 8]
+    page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8]
         .copy_from_slice(&next_free.to_le_bytes());
 }
 
@@ -423,7 +482,7 @@ pub fn write_free_page(page: &mut [u8], next_free: u64) {
 pub fn read_next_free(page: &[u8]) -> u64 {
     debug_assert_eq!(page.len(), PAGE_SIZE);
     u64::from_le_bytes(
-        page[NEXT_FREE_OFFSET..NEXT_FREE_OFFSET + 8]
+        page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8]
             .try_into()
             .unwrap(),
     )
@@ -456,6 +515,7 @@ mod tests {
         assert_eq!(node, decoded);
         assert!(!decoded.is_terminal());
         assert_eq!(decoded.children.len(), 0);
+        assert_eq!(decoded.overflow_page, NULL_PAGE);
     }
 
     #[test]
@@ -465,6 +525,28 @@ mod tests {
         let decoded = TrieNode::from_page(&page).unwrap();
         assert_eq!(node, decoded);
         assert!(decoded.is_terminal());
+    }
+
+    #[test]
+    fn round_trip_overflow_flag() {
+        let mut node = TrieNode::new();
+        node.flags |= FLAG_OVERFLOW;
+        node.overflow_page = 42;
+        let page = node.to_page().unwrap();
+        let decoded = TrieNode::from_page(&page).unwrap();
+        assert!(decoded.is_overflow());
+        assert_eq!(decoded.overflow_page, 42);
+    }
+
+    #[test]
+    fn round_trip_empty_gc_flag() {
+        let mut node = TrieNode::new();
+        node.flags = FLAG_EMPTY_GC;
+        node.value_offset = 99; // next_empty pointer
+        let page = node.to_page().unwrap();
+        let decoded = TrieNode::from_page(&page).unwrap();
+        assert_eq!(decoded.flags, FLAG_EMPTY_GC);
+        assert_eq!(decoded.value_offset, 99);
     }
 
     #[test]
@@ -501,7 +583,6 @@ mod tests {
     fn round_trip_max_children() {
         let mut node = TrieNode::new();
         for i in 0..MAX_CHILDREN {
-            // Each child has a single-byte segment equal to its index.
             node.children.push(make_child(&[i as u8], (i + 2) as u64));
         }
         assert_eq!(node.children.len(), MAX_CHILDREN);
@@ -537,7 +618,6 @@ mod tests {
     fn bad_magic_detected() {
         let node = TrieNode::new();
         let mut page = node.to_page().unwrap();
-        // Overwrite magic with garbage.
         page[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(matches!(TrieNode::from_page(&page), Err(TrieError::Corruption(_))));
     }
@@ -548,6 +628,8 @@ mod tests {
         hdr.root_page = 1;
         hdr.free_list_head = 2;
         hdr.num_pages = 64;
+        hdr.empty_node_head = 5;
+        hdr.entry_count = 42;
 
         let page = hdr.to_page();
         let decoded = FileHeader::from_page(&page).unwrap();
@@ -556,6 +638,8 @@ mod tests {
         assert_eq!(decoded.root_page, 1);
         assert_eq!(decoded.free_list_head, 2);
         assert_eq!(decoded.num_pages, 64);
+        assert_eq!(decoded.empty_node_head, 5);
+        assert_eq!(decoded.entry_count, 42);
     }
 
     #[test]
