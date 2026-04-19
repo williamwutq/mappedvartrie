@@ -165,7 +165,11 @@ pub fn read_existing(db_path: &Path) -> Result<Option<WalRecord>> {
         return Ok(None); // corrupted or truncated payload
     }
 
-    Ok(Some(WalRecord { op, segments, value }))
+    Ok(Some(WalRecord {
+        op,
+        segments,
+        value,
+    }))
 }
 
 /// Deletes the WAL file.  Returns `Ok(())` if the file is already absent.

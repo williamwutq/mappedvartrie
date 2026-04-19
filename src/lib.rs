@@ -33,18 +33,17 @@ pub mod error;
 pub mod key;
 pub mod node;
 pub mod store;
+pub mod trie;
 pub mod valheap;
 pub mod wal;
-pub mod trie;
 
 pub use error::{Result, TrieError};
 pub use key::TrieKey;
 pub use node::{
-    ChildSlot, FileHeader, TrieNode,
-    CHILD_SLOT_SIZE, FLAG_EMPTY_GC, FLAG_FREE, FLAG_HAS_VALUE, FLAG_OVERFLOW,
-    GROW_BATCH, MAX_CHILDREN, MAX_SEG_LEN, NODE_HDR_SIZE, NODE_MAGIC, FILE_MAGIC,
-    NULL_PAGE, PAGE_SIZE, VERSION,
+    CHILD_SLOT_SIZE, ChildSlot, FILE_MAGIC, FLAG_EMPTY_GC, FLAG_FREE, FLAG_HAS_VALUE,
+    FLAG_OVERFLOW, FileHeader, GROW_BATCH, MAX_CHILDREN, MAX_SEG_LEN, NODE_HDR_SIZE, NODE_MAGIC,
+    NULL_PAGE, PAGE_SIZE, TrieNode, VERSION,
 };
 pub use store::PageStore;
-pub use valheap::ValHeap;
 pub use trie::MappedVarTrie;
+pub use valheap::ValHeap;

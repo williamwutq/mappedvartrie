@@ -51,8 +51,8 @@ use std::sync::Mutex;
 use crate::error::{Result, TrieError};
 use crate::key::TrieKey;
 use crate::node::{
-    ChildSlot, TrieNode, FLAG_EMPTY_GC, FLAG_HAS_VALUE, FLAG_OVERFLOW,
-    MAX_CHILDREN, MAX_SEG_LEN, NULL_PAGE,
+    ChildSlot, FLAG_EMPTY_GC, FLAG_HAS_VALUE, FLAG_OVERFLOW, MAX_CHILDREN, MAX_SEG_LEN, NULL_PAGE,
+    TrieNode,
 };
 use crate::store::PageStore;
 use crate::valheap::ValHeap;
@@ -320,7 +320,11 @@ impl TrieInner {
             let depth_primary = current_page;
             match Self::find_child_detail(&self.store, current_page, segment)? {
                 Some((host_page, slot_idx, child_page)) => {
-                    path.push(PathStep { depth_primary, host_page, slot_idx });
+                    path.push(PathStep {
+                        depth_primary,
+                        host_page,
+                        slot_idx,
+                    });
                     current_page = child_page;
                 }
                 None => return Ok(()), // key not present
@@ -348,8 +352,7 @@ impl TrieInner {
         let mut page_to_prune = current_page;
         for step in path.iter().rev() {
             let pruned_node = self.store.read_node(page_to_prune)?;
-            let total_children =
-                Self::count_children_total(&self.store, page_to_prune)?;
+            let total_children = Self::count_children_total(&self.store, page_to_prune)?;
             if pruned_node.flags & FLAG_HAS_VALUE == 0 && total_children == 0 {
                 // Remove the child slot from the host page.
                 let mut host_node = self.store.read_node(step.host_page)?;
@@ -570,11 +573,7 @@ impl MappedVarTrie {
             match record.op {
                 WAL_OP_INSERT => inner.insert(&seg_refs, &record.value)?,
                 WAL_OP_DELETE => inner.delete(&seg_refs)?,
-                op => {
-                    return Err(TrieError::Corruption(format!(
-                        "unknown WAL op: {op:#04x}"
-                    )))
-                }
+                op => return Err(TrieError::Corruption(format!("unknown WAL op: {op:#04x}"))),
             }
             inner.store.flush()?;
             inner.heap.flush()?;
@@ -607,9 +606,10 @@ impl MappedVarTrie {
 
         wal::write_insert(&self.db_path, segments, value)?;
 
-        let mut inner = self.inner.lock().map_err(|_| {
-            TrieError::Corruption("mutex poisoned".into())
-        })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| TrieError::Corruption("mutex poisoned".into()))?;
         inner.insert(segments, value)?;
 
         inner.store.flush()?;
@@ -632,9 +632,10 @@ impl MappedVarTrie {
 
         wal::write_delete(&self.db_path, segments)?;
 
-        let mut inner = self.inner.lock().map_err(|_| {
-            TrieError::Corruption("mutex poisoned".into())
-        })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| TrieError::Corruption("mutex poisoned".into()))?;
         inner.delete(segments)?;
 
         inner.store.flush()?;
@@ -645,17 +646,19 @@ impl MappedVarTrie {
 
     /// Returns the value at `segments`, or `None` if the key is absent.
     pub fn get(&self, segments: &[&[u8]]) -> Result<Option<Vec<u8>>> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            TrieError::Corruption("mutex poisoned".into())
-        })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| TrieError::Corruption("mutex poisoned".into()))?;
         inner.get(segments)
     }
 
     /// Returns `true` if a value is stored at `segments`.
     pub fn contains_key(&self, segments: &[&[u8]]) -> Result<bool> {
-        let inner = self.inner.lock().map_err(|_| {
-            TrieError::Corruption("mutex poisoned".into())
-        })?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| TrieError::Corruption("mutex poisoned".into()))?;
         inner.contains(segments)
     }
 
@@ -664,9 +667,10 @@ impl MappedVarTrie {
     /// The count is maintained incrementally and may be slightly off after a
     /// crash (the WAL protects key integrity; the count is best-effort).
     pub fn len(&self) -> Result<u64> {
-        let inner = self.inner.lock().map_err(|_| {
-            TrieError::Corruption("mutex poisoned".into())
-        })?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| TrieError::Corruption("mutex poisoned".into()))?;
         let hdr = inner.store.header()?;
         Ok(hdr.entry_count)
     }
@@ -680,19 +684,17 @@ impl MappedVarTrie {
     ///
     /// Returns a `Vec` of `(full_segments, value)` pairs.  `full_segments`
     /// includes the prefix segments followed by the suffix path.
-    pub fn prefix_scan(
-        &self,
-        prefix: &[&[u8]],
-    ) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            TrieError::Corruption("mutex poisoned".into())
-        })?;
+    #[allow(clippy::type_complexity)]
+    pub fn prefix_scan(&self, prefix: &[&[u8]]) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| TrieError::Corruption("mutex poisoned".into()))?;
 
         // Navigate to the node at the end of the prefix.
         let root_page = inner.store.header()?.root_page;
         let mut current_page = root_page;
-        let mut prefix_segs: Vec<Vec<u8>> =
-            prefix.iter().map(|s| s.to_vec()).collect();
+        let mut prefix_segs: Vec<Vec<u8>> = prefix.iter().map(|s| s.to_vec()).collect();
 
         for &segment in prefix {
             match TrieInner::find_child(&inner.store, current_page, segment)? {
@@ -739,10 +741,8 @@ impl MappedVarTrie {
     }
 
     /// Prefix scan using a [`TrieKey`]-typed prefix.
-    pub fn prefix_scan_key<K: TrieKey>(
-        &self,
-        prefix: &K,
-    ) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>> {
+    #[allow(clippy::type_complexity)]
+    pub fn prefix_scan_key<K: TrieKey>(&self, prefix: &K) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>> {
         let owned: Vec<K::Segment> = prefix.segments().collect();
         let segs: Vec<&[u8]> = owned.iter().map(|s| s.as_ref()).collect();
         self.prefix_scan(&segs)
@@ -844,10 +844,7 @@ mod tests {
         t.insert(&[b"a", b"b"], b"ab_val").unwrap();
         t.delete(&[b"a"]).unwrap(); // "a" has no value, no-op
 
-        assert_eq!(
-            t.get(&[b"a", b"b"]).unwrap(),
-            Some(b"ab_val".to_vec())
-        );
+        assert_eq!(t.get(&[b"a", b"b"]).unwrap(), Some(b"ab_val".to_vec()));
     }
 
     // -----------------------------------------------------------------------
@@ -871,10 +868,7 @@ mod tests {
             t.get(&[b"com", b"example", b"mail"]).unwrap(),
             Some(b"email".to_vec())
         );
-        assert_eq!(
-            t.get(&[b"com", b"other"]).unwrap(),
-            Some(b"other".to_vec())
-        );
+        assert_eq!(t.get(&[b"com", b"other"]).unwrap(), Some(b"other".to_vec()));
         assert_eq!(t.get(&[b"com", b"example"]).unwrap(), None);
     }
 
@@ -927,10 +921,7 @@ mod tests {
         wal::write_insert(&db_path, &[b"crash_key"], b"crash_val").unwrap();
 
         let t = MappedVarTrie::open(&db_path).unwrap();
-        assert_eq!(
-            t.get(&[b"crash_key"]).unwrap(),
-            Some(b"crash_val".to_vec())
-        );
+        assert_eq!(t.get(&[b"crash_key"]).unwrap(), Some(b"crash_val".to_vec()));
         assert!(!wal::wal_path(&db_path).exists());
     }
 
@@ -1006,10 +997,7 @@ mod tests {
 
         let seg = [0xFFu8; MAX_SEG_LEN];
         t.insert(&[&seg], b"max_seg_val").unwrap();
-        assert_eq!(
-            t.get(&[&seg]).unwrap(),
-            Some(b"max_seg_val".to_vec())
-        );
+        assert_eq!(t.get(&[&seg]).unwrap(), Some(b"max_seg_val".to_vec()));
     }
 
     #[test]
@@ -1279,9 +1267,16 @@ mod tests {
         {
             let inner = t.inner.lock().unwrap();
             let root = inner.store.read_node(1).unwrap();
-            assert_eq!(root.children.len(), 1, "root should have exactly one child (p)");
+            assert_eq!(
+                root.children.len(),
+                1,
+                "root should have exactly one child (p)"
+            );
             let p_node = inner.store.read_node(root.children[0].child_page).unwrap();
-            assert!(p_node.is_overflow(), "intermediate 'p' node should overflow");
+            assert!(
+                p_node.is_overflow(),
+                "intermediate 'p' node should overflow"
+            );
         }
     }
 
@@ -1306,7 +1301,11 @@ mod tests {
         for i in 0..n {
             let seg = (i as u16).to_le_bytes();
             let val = t.get(&[seg.as_ref()]).unwrap();
-            assert_eq!(val, Some(vec![i as u8]), "key {i} missing in 3-page overflow");
+            assert_eq!(
+                val,
+                Some(vec![i as u8]),
+                "key {i} missing in 3-page overflow"
+            );
         }
 
         assert_eq!(t.len().unwrap(), n as u64);
@@ -1343,7 +1342,10 @@ mod tests {
                 !root.is_overflow(),
                 "FLAG_OVERFLOW should be cleared after overflow page is emptied"
             );
-            assert_eq!(root.overflow_page, 0, "overflow_page should be NULL after compaction");
+            assert_eq!(
+                root.overflow_page, 0,
+                "overflow_page should be NULL after compaction"
+            );
             // The root's GC list should now contain the freed pages.
             let hdr = inner.store.header().unwrap();
             assert_ne!(hdr.empty_node_head, 0, "GC list should have freed pages");
@@ -1456,7 +1458,10 @@ mod tests {
             let t = reopen(&dir);
             let inner = t.inner.lock().unwrap();
             let hdr = inner.store.header().unwrap();
-            assert_ne!(hdr.empty_node_head, 0, "GC list head must persist across reopen");
+            assert_ne!(
+                hdr.empty_node_head, 0,
+                "GC list head must persist across reopen"
+            );
         }
     }
 
@@ -1495,7 +1500,10 @@ mod tests {
             }
             count
         };
-        assert_eq!(gc_count_after_delete, 3, "3 child/terminal nodes should be in GC");
+        assert_eq!(
+            gc_count_after_delete, 3,
+            "3 child/terminal nodes should be in GC"
+        );
 
         // Re-inserting 3 new keys should reuse GC pages without growing file.
         t.insert(&[b"d"], b"4").unwrap();
@@ -1506,7 +1514,10 @@ mod tests {
             let inner = t.inner.lock().unwrap();
             inner.store.header().unwrap().num_pages
         };
-        assert_eq!(pages_before, pages_after_reinsert, "file should not grow when GC list has entries");
+        assert_eq!(
+            pages_before, pages_after_reinsert,
+            "file should not grow when GC list has entries"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1520,8 +1531,7 @@ mod tests {
 
         // 10-segment key → allocates one node per segment level.
         let segs: [&[u8]; 10] = [
-            b"s0", b"s1", b"s2", b"s3", b"s4",
-            b"s5", b"s6", b"s7", b"s8", b"s9",
+            b"s0", b"s1", b"s2", b"s3", b"s4", b"s5", b"s6", b"s7", b"s8", b"s9",
         ];
         t.insert(&segs, b"deep").unwrap();
 
@@ -1536,7 +1546,10 @@ mod tests {
         {
             let inner = t.inner.lock().unwrap();
             let hdr = inner.store.header().unwrap();
-            assert_ne!(hdr.empty_node_head, 0, "GC list must be non-empty after deep pruning");
+            assert_ne!(
+                hdr.empty_node_head, 0,
+                "GC list must be non-empty after deep pruning"
+            );
             // entry_count should be 0.
             assert_eq!(hdr.entry_count, 0);
         }
@@ -1666,7 +1679,11 @@ mod tests {
         t.insert(&[b"root", b"child2"], b"c2_val").unwrap();
 
         let results = t.prefix_scan(&[b"root"]).unwrap();
-        assert_eq!(results.len(), 3, "scan should include the prefix endpoint itself");
+        assert_eq!(
+            results.len(),
+            3,
+            "scan should include the prefix endpoint itself"
+        );
 
         let values: Vec<&[u8]> = results.iter().map(|(_, v)| v.as_slice()).collect();
         assert!(values.contains(&b"root_val".as_ref()));
@@ -1687,7 +1704,11 @@ mod tests {
         }
 
         let results = t.prefix_scan(&[b"pre"]).unwrap();
-        assert_eq!(results.len(), n, "prefix scan should find all overflow children");
+        assert_eq!(
+            results.len(),
+            n,
+            "prefix scan should find all overflow children"
+        );
 
         // All segments should be present.
         let mut found: Vec<u8> = results.iter().map(|(segs, _)| segs[1][0]).collect();
@@ -1732,7 +1753,10 @@ mod tests {
         let overflow_key = (n - 1) as u8;
         t.insert(&[&[overflow_key]], b"new_value").unwrap();
         assert_eq!(t.len().unwrap(), n as u64);
-        assert_eq!(t.get(&[&[overflow_key]]).unwrap(), Some(b"new_value".to_vec()));
+        assert_eq!(
+            t.get(&[&[overflow_key]]).unwrap(),
+            Some(b"new_value".to_vec())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1769,7 +1793,11 @@ mod tests {
         // Manually corrupt the version field (at byte offset 4..6 in page 0).
         {
             use std::io::{Seek, SeekFrom, Write};
-            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
             // Rebuild header with version = VERSION + 1.
             let mut hdr_page = [0u8; PAGE_SIZE];
             f.seek(SeekFrom::Start(0)).unwrap();
@@ -1788,7 +1816,10 @@ mod tests {
         }
 
         let result = MappedVarTrie::open(&path);
-        assert!(result.is_err(), "opening a file with wrong version should fail");
+        assert!(
+            result.is_err(),
+            "opening a file with wrong version should fail"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1824,7 +1855,10 @@ mod tests {
             let inner = t.inner.lock().unwrap();
             inner.store.header().unwrap().num_pages
         };
-        assert_eq!(pages_before, pages_after, "GC reuse should prevent file growth in round 3");
+        assert_eq!(
+            pages_before, pages_after,
+            "GC reuse should prevent file growth in round 3"
+        );
         assert_eq!(t.len().unwrap(), 40);
 
         // All round-3 keys accessible.
@@ -1938,8 +1972,7 @@ mod tests {
 
     impl TrieKey for NumericKey {
         type Segment = [u8; 4];
-        type SegmentIter<'a> =
-            std::iter::Map<std::slice::Iter<'a, u32>, fn(&u32) -> [u8; 4]>;
+        type SegmentIter<'a> = std::iter::Map<std::slice::Iter<'a, u32>, fn(&u32) -> [u8; 4]>;
 
         fn segments(&self) -> Self::SegmentIter<'_> {
             self.0.iter().map(|n| n.to_be_bytes())
@@ -1970,10 +2003,7 @@ mod tests {
         let seg_with_null = b"he\x00llo";
         t.insert(&[seg_with_null], b"v1").unwrap();
         // Same segment including the null byte matches.
-        assert_eq!(
-            t.get(&[seg_with_null]).unwrap(),
-            Some(b"v1".to_vec())
-        );
+        assert_eq!(t.get(&[seg_with_null]).unwrap(), Some(b"v1".to_vec()));
         // Truncated at null does NOT match.
         assert_eq!(t.get(&[b"he"]).unwrap(), None);
         // Past-null portion alone does NOT match.
@@ -2201,9 +2231,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = open(&dir);
 
-        let d1 = domain_key("www.example.com");   // → ["com","example","www"]
-        let d2 = domain_key("mail.example.com");   // → ["com","example","mail"]
-        let d3 = domain_key("www.other.org");      // → ["org","other","www"]
+        let d1 = domain_key("www.example.com"); // → ["com","example","www"]
+        let d2 = domain_key("mail.example.com"); // → ["com","example","mail"]
+        let d3 = domain_key("www.other.org"); // → ["org","other","www"]
 
         t.insert_key(&d1, b"www").unwrap();
         t.insert_key(&d2, b"mail").unwrap();
@@ -2446,7 +2476,11 @@ mod tests {
         // After writer finishes: odd keys must have value [i, i]; even keys deleted.
         for i in 0u8..50 {
             if i % 2 == 0 {
-                assert_eq!(t.get(&[&[i]]).unwrap(), None, "even key {i} should be deleted");
+                assert_eq!(
+                    t.get(&[&[i]]).unwrap(),
+                    None,
+                    "even key {i} should be deleted"
+                );
             } else {
                 assert_eq!(
                     t.get(&[&[i]]).unwrap(),

@@ -96,6 +96,7 @@ impl ValHeap {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(!file_exists)
             .open(path)?;
 
         if file_exists {

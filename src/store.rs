@@ -28,8 +28,8 @@ use memmap2::MmapMut;
 
 use crate::error::{Result, TrieError};
 use crate::node::{
-    write_free_page, read_next_free, FileHeader, TrieNode,
-    FILE_MAGIC, GROW_BATCH, NULL_PAGE, PAGE_SIZE,
+    FILE_MAGIC, FileHeader, GROW_BATCH, NULL_PAGE, PAGE_SIZE, TrieNode, read_next_free,
+    write_free_page,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,7 @@ impl PageStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(!file_exists)
             .open(path)?;
 
         if file_exists {
@@ -94,7 +95,11 @@ impl PageStore {
 
         // Chain free pages: 2 → 3 → … → (initial_pages−1) → NULL.
         for i in 2..initial_pages {
-            let next = if i + 1 < initial_pages { i + 1 } else { NULL_PAGE };
+            let next = if i + 1 < initial_pages {
+                i + 1
+            } else {
+                NULL_PAGE
+            };
             let start = i as usize * PAGE_SIZE;
             write_free_page(&mut mmap[start..start + PAGE_SIZE], next);
         }
@@ -114,7 +119,9 @@ impl PageStore {
         let mmap = unsafe { MmapMut::map_mut(&file) }?;
 
         if mmap.len() < PAGE_SIZE {
-            return Err(TrieError::Corruption("file too small for header page".into()));
+            return Err(TrieError::Corruption(
+                "file too small for header page".into(),
+            ));
         }
 
         // Validate magic before trusting any other fields.
@@ -272,10 +279,7 @@ impl PageStore {
 
         // Swap the live mapping out before touching the file size.
         // `map_anon(1)` is a 1-byte anonymous mapping — valid but harmless.
-        let old_mmap = std::mem::replace(
-            &mut self.mmap,
-            MmapMut::map_anon(1)?,
-        );
+        let old_mmap = std::mem::replace(&mut self.mmap, MmapMut::map_anon(1)?);
         drop(old_mmap); // fully release before the file is extended
 
         self.file.set_len(new_size)?;
@@ -294,7 +298,11 @@ impl PageStore {
         // Forward pass: page i → page i+1, except the last page → old_free_head.
         // The resulting chain: first_new+1 → first_new+2 → … → new_total-1 → old_free_head.
         for i in first_new + 1..new_total {
-            let next = if i + 1 < new_total { i + 1 } else { old_free_head };
+            let next = if i + 1 < new_total {
+                i + 1
+            } else {
+                old_free_head
+            };
             let start = i as usize * PAGE_SIZE;
             write_free_page(&mut self.mmap[start..start + PAGE_SIZE], next);
         }
@@ -319,7 +327,7 @@ impl PageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{ChildSlot, MAX_SEG_LEN, MAX_CHILDREN, FLAG_HAS_VALUE};
+    use crate::node::{ChildSlot, FLAG_HAS_VALUE, MAX_CHILDREN, MAX_SEG_LEN};
 
     fn make_child(segment: &[u8], child_page: u64) -> ChildSlot {
         let mut seg_bytes = [0u8; MAX_SEG_LEN];
@@ -499,7 +507,8 @@ mod tests {
 
         let mut node = TrieNode::new();
         for i in 0..MAX_CHILDREN {
-            node.children.push(make_child(&[i as u8; 64], (i + 2) as u64));
+            node.children
+                .push(make_child(&[i as u8; 64], (i + 2) as u64));
         }
 
         let idx = store.alloc_page().unwrap();

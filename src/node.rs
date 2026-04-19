@@ -383,9 +383,7 @@ impl TrieNode {
             )));
         }
 
-        let stored_crc = u32::from_le_bytes(
-            page[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap(),
-        );
+        let stored_crc = u32::from_le_bytes(page[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap());
         let computed_crc = node_crc(page);
         if stored_crc != computed_crc {
             return Err(TrieError::Corruption(format!(
@@ -409,10 +407,14 @@ impl TrieNode {
         }
         let value_len = u16::from_le_bytes(page[12..14].try_into().unwrap());
         let value_offset = u64::from_le_bytes(
-            page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8].try_into().unwrap(),
+            page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8]
+                .try_into()
+                .unwrap(),
         );
         let overflow_page = u64::from_le_bytes(
-            page[OVERFLOW_PAGE_OFFSET..OVERFLOW_PAGE_OFFSET + 8].try_into().unwrap(),
+            page[OVERFLOW_PAGE_OFFSET..OVERFLOW_PAGE_OFFSET + 8]
+                .try_into()
+                .unwrap(),
         );
 
         let mut children = Vec::with_capacity(n_children);
@@ -431,11 +433,21 @@ impl TrieNode {
                     .try_into()
                     .unwrap(),
             );
-            children.push(ChildSlot { seg_len, seg_bytes, child_page });
+            children.push(ChildSlot {
+                seg_len,
+                seg_bytes,
+                child_page,
+            });
             off += CHILD_SLOT_SIZE;
         }
 
-        Ok(TrieNode { flags, value_len, value_offset, overflow_page, children })
+        Ok(TrieNode {
+            flags,
+            value_len,
+            value_offset,
+            overflow_page,
+            children,
+        })
     }
 }
 
@@ -474,8 +486,7 @@ pub fn write_free_page(page: &mut [u8], next_free: u64) {
     page.fill(0);
     page[0..4].copy_from_slice(&NODE_MAGIC.to_le_bytes());
     page[8] = FLAG_FREE;
-    page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8]
-        .copy_from_slice(&next_free.to_le_bytes());
+    page[VALUE_OFFSET_FIELD..VALUE_OFFSET_FIELD + 8].copy_from_slice(&next_free.to_le_bytes());
 }
 
 /// Reads the `next_free` pointer from a freed page.
@@ -611,7 +622,10 @@ mod tests {
         let mut page = node.to_page().unwrap();
         // Corrupt a data byte (not the CRC field itself).
         page[100] ^= 0xFF;
-        assert!(matches!(TrieNode::from_page(&page), Err(TrieError::Corruption(_))));
+        assert!(matches!(
+            TrieNode::from_page(&page),
+            Err(TrieError::Corruption(_))
+        ));
     }
 
     #[test]
@@ -619,7 +633,10 @@ mod tests {
         let node = TrieNode::new();
         let mut page = node.to_page().unwrap();
         page[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert!(matches!(TrieNode::from_page(&page), Err(TrieError::Corruption(_))));
+        assert!(matches!(
+            TrieNode::from_page(&page),
+            Err(TrieError::Corruption(_))
+        ));
     }
 
     #[test]
@@ -647,7 +664,10 @@ mod tests {
         let hdr = FileHeader::new_empty();
         let mut page = hdr.to_page();
         page[10] ^= 0x01; // corrupt a covered byte
-        assert!(matches!(FileHeader::from_page(&page), Err(TrieError::Corruption(_))));
+        assert!(matches!(
+            FileHeader::from_page(&page),
+            Err(TrieError::Corruption(_))
+        ));
     }
 
     #[test]
